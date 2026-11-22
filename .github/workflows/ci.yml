@@ -20,17 +20,8 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
-  # Inline rather than tkightly/shared-workflows: this repo is public, and a
-  # public repo can't call reusable workflows from a private one.
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - run: go vet ./...
-      - run: go test -race ./...
+    uses: tkightly/shared-workflows/.github/workflows/go-test.yml@v1.3.0
 
   lint:
     runs-on: ubuntu-latest
