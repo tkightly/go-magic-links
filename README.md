@@ -25,7 +25,7 @@ auth, err := magiclink.New(ctx, magiclink.Config{
 	// Wake the outbox worker once the email is committed.
 	AfterSend: worker.Wake,
 	// Map a verified email to your user ID (create the user on first sign-in).
-	SignIn: func(ctx context.Context, tx *sql.Tx, l magiclink.Link) (int64, error) {
+	SignIn: func(ctx context.Context, tx *sql.Tx, l magiclink.Link) (string, error) {
 		return upsertUser(ctx, tx, l.Email)
 	},
 })
@@ -81,7 +81,7 @@ know about.
 | Rate limits | Per IP, per address per 15 min and per day on link requests, and per IP on verifications. Every limit is checked before any is recorded, so a refused request doesn't use up the others. |
 | Not revealing who can sign in | For a disallowed address the module does the same work (insert, `Send`) and then rolls back. The response, the timing and any `Send` error are the same either way, and limits apply to every address alike. |
 | Email normalisation | Addresses are trimmed and lower-cased before any hook sees them. |
-| Schema | Its own `magiclink_links` and `magiclink_sessions` tables, created by `New`. |
+| Schema | Its own `magiclink_links` and `magiclink_sessions` tables, created and upgraded by `New`; its version is kept in its own `magiclink_schema` table, never the app's. |
 
 **What stays with the app** is policy that really differs between apps,
 passed in through hooks rather than options:
@@ -100,9 +100,11 @@ one-connection pool, so touching `DB` inside a hook would deadlock.
 
 **Choices that keep the interface small:**
 
-- The module never sees the user table. `SignIn` returns an `int64`, which
+- The module never sees the user table. `SignIn` returns the user's ID as
+  an opaque string (an integer formatted with `strconv`, a UUID, ...), which
   is stored on the session and handed back by `Authenticate`. That avoids a
-  second query per request without the module owning users.
+  second query per request without the module owning users, whatever their
+  IDs look like.
 - It has no HTTP layer. The two apps' JSON shapes, error bodies and
   client-IP rules differ, and an HTTP adapter would mostly be options. The
   HTTP handlers that remain in each app are about ten lines each.

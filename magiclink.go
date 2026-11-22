@@ -56,8 +56,9 @@ type Link struct {
 // Session is a signed-in user.
 type Session struct {
 	// Token is the session token to hand to the browser. Only set by Verify.
-	Token     string
-	UserID    int64
+	Token string
+	// UserID is whatever SignIn returned for this user.
+	UserID    string
 	Email     string
 	ExpiresAt time.Time
 }
@@ -89,11 +90,13 @@ type Config struct {
 	// for disallowed addresses), e.g. to wake the app's outbox worker.
 	AfterSend func()
 
-	// SignIn runs when a link is verified, and returns the user ID the
-	// session belongs to. It typically creates the user on first sign-in.
+	// SignIn runs when a link is verified, and returns the ID of the user
+	// the session belongs to, as an opaque string (an integer ID formatted
+	// with strconv, a UUID, ...). It typically creates the user on first
+	// sign-in.
 	// Returning an error aborts sign-in and leaves the link unused; the
 	// error is returned from Verify unchanged.
-	SignIn func(ctx context.Context, tx *sql.Tx, l Link) (userID int64, err error)
+	SignIn func(ctx context.Context, tx *sql.Tx, l Link) (userID string, err error)
 
 	// LinkTTL defaults to 15 minutes, SessionTTL to 30 days.
 	LinkTTL    time.Duration
@@ -124,7 +127,7 @@ type Auth struct {
 	verifiesPerIP    *ratelimit.Limiter
 }
 
-// New checks cfg and creates the module's tables if they don't exist.
+// New checks cfg and creates or upgrades the module's tables.
 func New(ctx context.Context, cfg Config) (*Auth, error) {
 	if cfg.DB == nil || cfg.Send == nil || cfg.SignIn == nil {
 		return nil, errors.New("magiclink: DB, Send and SignIn are required")
@@ -147,8 +150,8 @@ func New(ctx context.Context, cfg Config) (*Auth, error) {
 	l.LinksPerEmailPerDay = orDefault(l.LinksPerEmailPerDay, 10)
 	l.VerifiesPerIPPerHour = orDefault(l.VerifiesPerIPPerHour, max(30, 3*l.LinksPerIPPerHour))
 
-	if _, err := cfg.DB.ExecContext(ctx, schema); err != nil {
-		return nil, fmt.Errorf("magiclink: create tables: %w", err)
+	if err := migrate(ctx, cfg.DB); err != nil {
+		return nil, fmt.Errorf("magiclink: migrate tables: %w", err)
 	}
 	return &Auth{
 		cfg:              cfg,
@@ -158,26 +161,6 @@ func New(ctx context.Context, cfg Config) (*Auth, error) {
 		verifiesPerIP:    ratelimit.New(l.VerifiesPerIPPerHour, time.Hour).WithClock(cfg.Now),
 	}, nil
 }
-
-const schema = `
-CREATE TABLE IF NOT EXISTS magiclink_links (
-    token_hash  BLOB PRIMARY KEY,
-    email       TEXT NOT NULL,
-    state       TEXT,
-    expires_at  INTEGER NOT NULL
-) STRICT;
-CREATE INDEX IF NOT EXISTS magiclink_links_expires ON magiclink_links (expires_at);
-
-CREATE TABLE IF NOT EXISTS magiclink_sessions (
-    token_hash  BLOB PRIMARY KEY,
-    user_id     INTEGER NOT NULL,
-    email       TEXT NOT NULL,
-    created_at  INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL
-) STRICT;
-CREATE INDEX IF NOT EXISTS magiclink_sessions_expires ON magiclink_sessions (expires_at);
-CREATE INDEX IF NOT EXISTS magiclink_sessions_user ON magiclink_sessions (user_id);
-`
 
 // SendLink emails a sign-in link to email, if Allow permits. It returns nil
 // when Allow says no, so callers can always answer "if that address can sign
@@ -289,6 +272,9 @@ func (a *Auth) Verify(ctx context.Context, token, clientIP string) (Session, Lin
 		if err != nil {
 			return err
 		}
+		if userID == "" {
+			return errors.New("magiclink: SignIn returned an empty user ID")
+		}
 
 		if _, err := tx.ExecContext(ctx, `DELETE FROM magiclink_sessions WHERE expires_at <= ?`, now.Unix()); err != nil {
 			return err
@@ -344,7 +330,7 @@ func (a *Auth) SignOut(ctx context.Context, token string) error {
 
 // SignOutUser ends every session of a user, e.g. when their access is
 // revoked.
-func (a *Auth) SignOutUser(ctx context.Context, userID int64) error {
+func (a *Auth) SignOutUser(ctx context.Context, userID string) error {
 	_, err := a.cfg.DB.ExecContext(ctx, `DELETE FROM magiclink_sessions WHERE user_id = ?`, userID)
 	return err
 }

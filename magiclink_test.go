@@ -2,10 +2,12 @@ package magiclink_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -58,15 +60,15 @@ func newApp(t *testing.T, mutate ...func(*magiclink.Config)) *app {
 			return err
 		},
 		AfterSend: func() { a.woken++ },
-		SignIn: func(ctx context.Context, tx *sql.Tx, l magiclink.Link) (int64, error) {
+		SignIn: func(ctx context.Context, tx *sql.Tx, l magiclink.Link) (string, error) {
 			if a.signInErr != nil {
-				return 0, a.signInErr
+				return "", a.signInErr
 			}
 			var id int64
 			err := tx.QueryRowContext(ctx, `
 				INSERT INTO users (email) VALUES (?) ON CONFLICT (email) DO UPDATE SET email = excluded.email
 				RETURNING id`, l.Email).Scan(&id)
-			return id, err
+			return strconv.FormatInt(id, 10), err
 		},
 	}
 	for _, m := range mutate {
@@ -152,7 +154,7 @@ func TestSignInRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Email != "amy@example.com" || s.UserID == 0 || s.Token == "" {
+	if s.Email != "amy@example.com" || s.UserID == "" || s.Token == "" {
 		t.Fatalf("session = %+v", s)
 	}
 	if want := a.now.Add(30 * 24 * time.Hour); !s.ExpiresAt.Equal(want) {
@@ -299,7 +301,7 @@ func TestStateIsCarriedToEveryHookAndBack(t *testing.T) {
 			sendState = l.State
 			return send(ctx, tx, l)
 		}
-		c.SignIn = func(ctx context.Context, tx *sql.Tx, l magiclink.Link) (int64, error) {
+		c.SignIn = func(ctx context.Context, tx *sql.Tx, l magiclink.Link) (string, error) {
 			signInState = l.State
 			return signIn(ctx, tx, l)
 		}
@@ -449,7 +451,7 @@ func TestNewChecksConfig(t *testing.T) {
 	ok := magiclink.Config{
 		DB: db, LinkURL: "https://x.example/v",
 		Send:   func(context.Context, *sql.Tx, magiclink.Link) error { return nil },
-		SignIn: func(context.Context, *sql.Tx, magiclink.Link) (int64, error) { return 1, nil },
+		SignIn: func(context.Context, *sql.Tx, magiclink.Link) (string, error) { return "1", nil },
 	}
 	if _, err := magiclink.New(context.Background(), ok); err != nil {
 		t.Fatal(err)
@@ -470,5 +472,77 @@ func TestNewChecksConfig(t *testing.T) {
 		if _, err := magiclink.New(context.Background(), c); err == nil {
 			t.Errorf("%s: New succeeded", name)
 		}
+	}
+}
+
+func TestEmptyUserIDIsRefused(t *testing.T) {
+	a := newApp(t, func(c *magiclink.Config) {
+		c.SignIn = func(context.Context, *sql.Tx, magiclink.Link) (string, error) { return "", nil }
+	})
+	ctx := context.Background()
+	_ = a.auth.SendLink(ctx, "amy@example.com", "1.2.3.4", nil)
+	_, tokens := a.outbox(t)
+	if _, _, err := a.auth.Verify(ctx, tokens[0], "1.2.3.4"); err == nil {
+		t.Fatal("Verify accepted an empty user ID")
+	}
+	if n := a.count(t, "magiclink_sessions"); n != 0 {
+		t.Fatalf("%d sessions created, want 0", n)
+	}
+}
+
+func TestUUIDUserIDs(t *testing.T) {
+	const id = "0b8f8d6e-5c1a-4c47-9a4e-2f3d6f0e7a11"
+	a := newApp(t, func(c *magiclink.Config) {
+		c.SignIn = func(context.Context, *sql.Tx, magiclink.Link) (string, error) { return id, nil }
+	})
+	s := a.signIn(t, "amy@example.com")
+	got, err := a.auth.Authenticate(context.Background(), s.Token)
+	if err != nil || got.UserID != id {
+		t.Fatalf("Authenticate = %+v, %v; want user %s", got, err, id)
+	}
+}
+
+// A database made by v0.1.0 (integer user IDs, no magiclink_schema) is
+// upgraded in place, and its sessions keep working.
+func TestUpgradeFromV010KeepsSessions(t *testing.T) {
+	db, err := sql.Open("sqlite", "file::memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer func() { _ = db.Close() }()
+	now := time.Unix(1_800_000_000, 0)
+	token := strings.Repeat("A", 43) // a well-formed token; only its hash is stored
+	if _, err := db.Exec(`
+		CREATE TABLE magiclink_links (token_hash BLOB PRIMARY KEY, email TEXT NOT NULL, state TEXT, expires_at INTEGER NOT NULL) STRICT;
+		CREATE INDEX magiclink_links_expires ON magiclink_links (expires_at);
+		CREATE TABLE magiclink_sessions (token_hash BLOB PRIMARY KEY, user_id INTEGER NOT NULL, email TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL) STRICT;
+		CREATE INDEX magiclink_sessions_expires ON magiclink_sessions (expires_at);
+		CREATE INDEX magiclink_sessions_user ON magiclink_sessions (user_id);`); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256([]byte(token))
+	if _, err := db.Exec(`INSERT INTO magiclink_sessions VALUES (?, 42, 'amy@example.com', ?, ?)`,
+		h[:], now.Unix(), now.Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := magiclink.Config{
+		DB: db, LinkURL: "https://x.example/v", Now: func() time.Time { return now },
+		Send:   func(context.Context, *sql.Tx, magiclink.Link) error { return nil },
+		SignIn: func(context.Context, *sql.Tx, magiclink.Link) (string, error) { return "1", nil },
+	}
+	for range 2 { // the second New must be a no-op
+		auth, err := magiclink.New(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := auth.Authenticate(context.Background(), token)
+		if err != nil || s.UserID != "42" || s.Email != "amy@example.com" {
+			t.Fatalf("Authenticate after upgrade = %+v, %v; want user 42", s, err)
+		}
+	}
+	var typ string
+	if err := db.QueryRow(`SELECT type FROM pragma_table_info('magiclink_sessions') WHERE name = 'user_id'`).Scan(&typ); err != nil || typ != "TEXT" {
+		t.Fatalf("user_id column type = %q (%v), want TEXT", typ, err)
 	}
 }
