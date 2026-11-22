@@ -118,3 +118,11 @@ one-connection pool, so touching `DB` inside a hook would deadlock.
   uses `STRICT` tables and `RETURNING`.
 - Rate limits are kept in memory, so they suit a single API instance and
   reset on restart.
+
+## Releases
+
+Versions follow semver and are released by
+[release-please](https://github.com/googleapis/release-please) from
+[Conventional Commits](https://www.conventionalcommits.org/): `fix:` bumps the
+patch and `feat:` the minor (breaking changes too, until 1.0.0). Merging the
+release PR it keeps open tags `vX.Y.Z` and publishes the GitHub release.

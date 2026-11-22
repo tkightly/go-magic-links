@@ -1,0 +1,23 @@
+# Releases with release-please: it keeps a release PR open with the next
+# semver version (from Conventional Commits) and CHANGELOG, and merging that
+# PR tags vX.Y.Z and publishes the GitHub release, which the Go module proxy
+# then serves.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: tkightly/shared-workflows/.github/workflows/release-please.yml@v1.4.0
+    permissions:
+      contents: write
+      pull-requests: write
